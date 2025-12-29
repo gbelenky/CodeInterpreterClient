@@ -32,6 +32,7 @@ appsettings.*.json
 
 # Downloaded agent outputs
 agent_output_*.png
+!agent_output_20251229_183059_6coPHXqA.png
 agent_output_*.jpg
 agent_output_*.csv
 agent_output_*.json
