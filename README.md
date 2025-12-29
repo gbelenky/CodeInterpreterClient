@@ -370,152 +370,60 @@ Exiting...
 === Session Complete ===
 ```
 
-## Code Structure
+## Key AI Components
 
-### Main Components
-
-#### **Program.cs** (307 lines)
-
-**Configuration Loading (Lines 22-26)**
+**Agent Creation**
 ```csharp
-var configuration = new ConfigurationBuilder()
-    .SetBasePath(AppContext.BaseDirectory)
-    .AddJsonFile("appsettings.json", optional: false, reloadOnChange: true)
-    .Build();
-
-var projectEndpoint = configuration["AzureAI:ProjectEndpoint"];
-var agentName = configuration["AzureAI:AgentName"];
-```
-Loads settings from `appsettings.json` using Microsoft.Extensions.Configuration. Uses `AppContext.BaseDirectory` to ensure the config file is found regardless of the working directory when running from solution or project folder.
-
-**Client Initialization (Lines 35-40)**
-```csharp
-var credential = new DefaultAzureCredential();
 var persistentClient = new PersistentAgentsClient(projectEndpoint, credential);
+var agent = persistentClient.Administration.CreateAgent(
+    model: "gpt-4o",
+    name: agentName,
+    instructions: "You are a helpful data analysis assistant...",
+    tools: new List<ToolDefinition> { new CodeInterpreterToolDefinition() }
+).Value;
 ```
-Creates the legacy SDK client with Azure authentication.
+Creates an agent programmatically with code interpreter capabilities.
 
-**Agent Retrieval/Creation (Lines 42-56)**
+**Thread with File Attachment**
 ```csharp
-var agents = persistentClient.Administration.GetAgents();
-var agent = agents.FirstOrDefault(a => a.Name == agentName);
-
-if (agent == null)
+var toolResources = new ToolResources
 {
-    agent = persistentClient.Administration.CreateAgent(
-        model: "gpt-4o",
-        name: agentName,
-        instructions: "...",
-        tools: new List<ToolDefinition> { new CodeInterpreterToolDefinition() }
-    ).Value;
+    CodeInterpreter = new CodeInterpreterToolResource()
+};
+toolResources.CodeInterpreter.FileIds.Add(uploadedFileId);
+var thread = persistentClient.Threads.CreateThread(toolResources: toolResources);
+```
+**Critical**: Files must be attached during thread creation for agent access.
+
+**Agent Execution**
+```csharp
+persistentClient.Messages.CreateMessage(thread.Id, MessageRole.User, userRequest);
+var run = persistentClient.Runs.CreateRun(thread, agent).Value;
+
+while (run.Status == RunStatus.Queued || run.Status == RunStatus.InProgress)
+{
+    await Task.Delay(500);
+    run = persistentClient.Runs.GetRun(thread.Id, run.Id).Value;
 }
 ```
-**Key Point**: Legacy SDK cannot access portal-created agents. We must create agents programmatically or retrieve previously created ones.
+Sends user message and polls for completion.
 
-**File Selection (Lines 60-98)**
+**Response Processing**
 ```csharp
-var availableFiles = Directory.GetFiles(Directory.GetCurrentDirectory())
-    .Where(f => f.EndsWith(".xlsx") || f.EndsWith(".xls"))
-    .ToList();
-```
-Filters only Excel files for upload.
-
-**File Upload with Progress (Lines 75-94)**
-```csharp
-var uploadTask = Task.Run(async () =>
+var messages = persistentClient.Messages.GetMessages(thread.Id);
+foreach (var message in messages.Where(m => m.Role == MessageRole.Agent))
 {
-    var fileInfo = await persistentClient.Files.UploadFileAsync(
-        filePath: uploadedFilePath,
-        purpose: PersistentAgentFilePurpose.Agents);
-    return fileInfo.Value.Id;
-});
-
-while (!uploadTask.IsCompleted)
-{
-    Console.Write(".");  // Animated progress!
-    await Task.Delay(300);
-}
-```
-**Async Pattern**: Runs upload in background task while main thread displays progress dots.
-
-**Thread Creation (Lines 103-120)**
-```csharp
-if (!string.IsNullOrEmpty(uploadedFileId))
-{
-    var toolResources = new ToolResources
+    foreach (var content in message.ContentItems)
     {
-        CodeInterpreter = new CodeInterpreterToolResource()
-    };
-    toolResources.CodeInterpreter.FileIds.Add(uploadedFileId);
-    thread = persistentClient.Threads.CreateThread(toolResources: toolResources);
-}
-```
-**Critical**: Files must be attached via `toolResources` during thread creation for agent access.
-
-**Conversation Loop (Lines 125-244)**
-```csharp
-while (true)
-{
-    // 1. Get user input
-    var userRequest = Console.ReadLine();
-    
-    // 2. Create message in thread
-    persistentClient.Messages.CreateMessage(thread.Id, MessageRole.User, userRequest);
-    
-    // 3. Run agent with progress dots
-    var runTask = Task.Run(async () => {
-        var run = persistentClient.Runs.CreateRun(thread, agent).Value;
-        while (run.Status == RunStatus.Queued || run.Status == RunStatus.InProgress)
-        {
-            await Task.Delay(500);
-            run = persistentClient.Runs.GetRun(thread.Id, run.Id).Value;
-        }
-        return run;
-    });
-    
-    // 4. Display response and detect images
-    var messages = persistentClient.Messages.GetMessages(thread.Id);
-    foreach (var message in messages)
-    {
-        if (message.Role == MessageRole.Agent && message.RunId == completedRun.Id)
-        {
-            foreach (var content in message.ContentItems)
-            {
-                if (content is MessageImageFileContent imageFileContent)
-                {
-                    imageFileIds.Add(imageFileContent.FileId);
-                }
-            }
-        }
-    }
-    
-    // 5. Offer to download generated files
-    if (imageFileIds.Count > 0)
-    {
-        // Prompt user and download
+        if (content is MessageTextContent textContent)
+            Console.WriteLine(textContent.Text);
+        else if (content is MessageImageFileContent imageFileContent)
+            // Download generated visualization
+            var fileContent = persistentClient.Files.GetFileContent(imageFileContent.FileId).Value;
     }
 }
 ```
-**State Management**: Each message is added to the thread, maintaining full conversation context.
-
-**File Download (Lines 267-285)**
-```csharp
-private static async Task DownloadFileAsync(PersistentAgentsClient client, string fileId)
-{
-    BinaryData fileContent = client.Files.GetFileContent(fileId).Value;
-    string fileName = $"agent_output_{DateTime.Now:yyyyMMdd_HHmmss}_{fileId.Substring(fileId.Length - 8)}.png";
-    await File.WriteAllBytesAsync(Path.Combine(Directory.GetCurrentDirectory(), fileName), fileContent.ToArray());
-}
-```
-**Naming Strategy**: Timestamped filenames prevent conflicts across multiple runs.
-
-**Helper Methods (Lines 254-265)**
-```csharp
-private static string FormatFileSize(long bytes)
-{
-    // Human-readable file size formatting
-}
-```
+Retrieves agent responses and detects generated images.
 
 ## Migration Path to Modern SDK
 
