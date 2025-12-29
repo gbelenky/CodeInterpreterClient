@@ -1,0 +1,65 @@
+# .NET Build Output
+bin/
+obj/
+*.dll
+*.exe
+*.pdb
+
+# User-specific files
+*.user
+*.userosscache
+*.suo
+*.sln.docstates
+
+# Configuration files with secrets
+appsettings.json
+appsettings.*.json
+!appsettings.sample.json
+
+# VS Code
+.vscode/
+!.vscode/settings.json
+!.vscode/tasks.json
+!.vscode/launch.json
+!.vscode/extensions.json
+
+# Visual Studio
+.vs/
+*.rsuser
+*.sln.ide
+*.ide-shm
+*.ide-wal
+
+# Downloaded agent outputs
+agent_output_*.png
+agent_output_*.jpg
+agent_output_*.csv
+agent_output_*.json
+
+# Azure
+.azure/
+
+# macOS
+.DS_Store
+
+# Windows
+Thumbs.db
+desktop.ini
+
+# Test results
+TestResults/
+*.trx
+*.coverage
+
+# NuGet
+*.nupkg
+*.snupkg
+.nuget/
+packages/
+
+# Rider
+.idea/
+*.sln.iml
+
+# dotCover
+*.dotCover
