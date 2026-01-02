@@ -1,54 +1,128 @@
 # Code Interpreter Client (.NET)
 
-A .NET console application that demonstrates file upload and code interpreter capabilities using Azure AI Foundry Agents with the **Azure.AI.Agents.Persistent (Legacy) SDK**.
+A .NET console application that demonstrates file upload and code interpreter capabilities using Azure AI Foundry Agents with a **Hybrid Architecture**: Microsoft Agent Framework (MAF) for streaming chat + `Azure.AI.Agents.Persistent` SDK for file operations.
 
 ## Architecture Overview
 
-### Framework Ecosystem
+### Hybrid Approach
 
-This project navigates the current Azure AI agent SDK landscape:
+This project uses a **hybrid architecture** that combines the best of both worlds:
+
+| Component | Technology | Purpose |
+|-----------|------------|---------|
+| **Chat Interface** | Microsoft Agent Framework (MAF) | Real-time streaming responses via `IChatClient` |
+| **File Upload** | `Azure.AI.Agents.Persistent` | Upload Excel files for analysis |
+| **File Download** | `Azure.AI.Agents.Persistent` | Download agent-generated visualizations |
+| **Agent Creation** | `Azure.AI.Agents.Persistent` | Programmatic agent setup with code interpreter |
+
+### Why Hybrid?
+
+**MAF Benefits:**
+- ✅ `IChatClient` interface - standardized chat abstraction
+- ✅ `RunStreamingAsync()` - real-time token streaming
+- ✅ `ChatClientAgent` - clean agent wrapper pattern
+- ✅ Future-proof architecture aligned with Microsoft's direction
+
+**MAF Limitation:**
+- ❌ Abstracts away `MessageImageFileContent` - file IDs appear as `sandbox:` URLs in text output
+
+**Solution**: After MAF streaming completes, use the persistent client to query messages and extract actual file IDs for download.
+
+### How MAF and Persistent Agent Interact
+
+The hybrid architecture works by linking MAF's abstraction layer to the underlying persistent agent infrastructure:
+
+```
+┌────────────────────────────────────────────────────────────────────────────┐
+│                         Request/Response Flow                               │
+├────────────────────────────────────────────────────────────────────────────┤
+│                                                                            │
+│  User Input                                                                │
+│      │                                                                     │
+│      ▼                                                                     │
+│  ┌─────────────────────────────────────────────────────────────────────┐  │
+│  │  MAF Layer (ChatClientAgent)                                         │  │
+│  │                                                                      │  │
+│  │  1. RunStreamingAsync(userRequest, mafThread)                        │  │
+│  │     └─► Internally calls persistent agent via IChatClient            │  │
+│  │                                                                      │  │
+│  │  2. Streams tokens back in real-time                                 │  │
+│  │     └─► foreach (var update in stream) Console.Write(update.Text)   │  │
+│  │                                                                      │  │
+│  │  ⚠️  File references abstracted as sandbox: URLs in text            │  │
+│  └─────────────────────────────────────────────────────────────────────┘  │
+│      │                                                                     │
+│      │ After streaming completes                                           │
+│      ▼                                                                     │
+│  ┌─────────────────────────────────────────────────────────────────────┐  │
+│  │  Persistent Layer (PersistentAgentsClient)                           │  │
+│  │                                                                      │  │
+│  │  3. GetRuns(persistentThread.Id) → Find latest run ID                │  │
+│  │                                                                      │  │
+│  │  4. GetMessages(threadId, Descending) → Get all messages             │  │
+│  │                                                                      │  │
+│  │  5. Extract MessageImageFileContent from agent messages              │  │
+│  │     └─► Real file IDs like "assistant-2kXRAbFNbmmd..."              │  │
+│  │                                                                      │  │
+│  │  6. Files.GetFileContent(fileId) → Download binary data              │  │
+│  └─────────────────────────────────────────────────────────────────────┘  │
+│      │                                                                     │
+│      ▼                                                                     │
+│  Downloaded File (e.g., agent_output_20260102_182152_cQ871hn6.png)        │
+│                                                                            │
+└────────────────────────────────────────────────────────────────────────────┘
+```
+
+#### Key Integration Points
+
+1. **`AsIChatClient()` Extension Method**
+   ```csharp
+   IChatClient chatClient = persistentClient.AsIChatClient(persistentAgent.Id);
+   ```
+   This bridges the persistent SDK to MAF by creating an `IChatClient` wrapper around a specific agent. The wrapper handles message creation, run execution, and response retrieval internally.
+
+2. **Linked Thread IDs**
+   ```csharp
+   var persistentThread = persistentClient.Threads.CreateThread(toolResources).Value;
+   var mafThread = mafAgent.GetNewThread(persistentThread.Id);  // Same ID!
+   ```
+   Both threads share the **same conversation ID**. When MAF executes a run, it operates on the same thread that the persistent client can query. This enables post-run inspection of messages.
+
+3. **Message Visibility**
+   - **MAF sees**: Text content streamed token-by-token
+   - **Persistent client sees**: Full message structure including `MessageImageFileContent` with actual file IDs
+   
+   This difference is why the hybrid approach is necessary—MAF provides better UX for chat, but persistent client provides access to file metadata.
+
+4. **Run Synchronization**
+   After `RunStreamingAsync()` completes, the run is finished on the server. The persistent client can immediately query:
+   - `Runs.GetRuns()` to find the completed run
+   - `Messages.GetMessages()` to inspect all content types
+   - `Files.GetFileContent()` to download generated files
+
+### Framework Ecosystem
 
 #### **Microsoft Agent Framework (MAF)**
 The overarching framework for building AI agents in the Microsoft ecosystem. It provides:
 - Standardized patterns for agent creation and interaction
-- Consistent APIs across different hosting options
-- Integration with Azure AI Foundry
+- `IChatClient` interface from `Microsoft.Extensions.AI`
+- Integration with Azure AI Foundry via `AsIChatClient()`
 
 #### **Azure AI Foundry Types**
 
-1. **Azure AI Foundry (New/Modern)**
+1. **Azure AI Foundry (Modern)**
    - Portal: [ai.azure.com](https://ai.azure.com)
    - SDK: `Microsoft.Agents.AI.AzureAI` (preview)
    - Pre-created agents via portal
    - Simplified API surface
-   - **Limitation**: File upload APIs not yet exposed
-   - Status: Active development, recommended for new projects *without file upload*
+   - Status: Active development
 
 2. **Azure AI Foundry Classic**
    - Portal: [ai.azure.com](https://ai.azure.com) (same portal, different agent type)
    - SDK: `Azure.AI.Agents.Persistent` (stable)
    - Full-featured API including file operations
    - Agents created programmatically
-   - Complete control over agent lifecycle
    - Status: Stable, feature-complete
-
-### Why We Use the Legacy SDK
-
-**Primary Reason: File Upload Capability**
-
-The modern `Microsoft.Agents.AI` SDK currently does not expose file upload APIs, which are essential for our use case:
-- Upload Excel/CSV files for data analysis
-- Attach files to conversation threads
-- Download agent-generated visualizations
-
-The legacy `Azure.AI.Agents.Persistent` SDK provides:
-- ✅ `Files.UploadFileAsync()` - Upload files to agents
-- ✅ `Threads.CreateThread(toolResources)` - Attach files to threads
-- ✅ `Files.GetFileContent()` - Download generated files
-- ✅ `Administration.CreateAgent()` - Programmatic agent creation
-- ✅ Full Message/Run lifecycle management
-
-**Trade-off**: We create agents programmatically instead of using pre-created portal agents.
 
 ## Key Technologies
 
@@ -57,25 +131,26 @@ The legacy `Azure.AI.Agents.Persistent` SDK provides:
 <PackageReference Include="Azure.AI.Agents.Persistent" Version="*-*" />
 <PackageReference Include="Azure.AI.Projects" Version="*-*" />
 <PackageReference Include="Azure.Identity" Version="*-*" />
+<PackageReference Include="Microsoft.Agents.AI.AzureAI" Version="*-*" />
+<PackageReference Include="Microsoft.Extensions.AI" Version="*-*" />
 <PackageReference Include="Microsoft.Extensions.Configuration" Version="9.0.0" />
 <PackageReference Include="Microsoft.Extensions.Configuration.Json" Version="9.0.0" />
 ```
 
 ### SDK Comparison
 
-| Feature | Legacy (`Azure.AI.Agents.Persistent`) | Modern (`Microsoft.Agents.AI`) |
-|---------|---------------------------------------|--------------------------------|
-| **File Upload** | ✅ Supported | ❌ Not exposed |
-| **File Download** | ✅ Supported | ❌ Not exposed |
-| **Agent Creation** | Programmatic only | Portal or Programmatic |
-| **Pre-created Agents** | ❌ Cannot access | ✅ Can retrieve |
-| **API Complexity** | More explicit | More abstracted |
-| **Status** | Stable | Preview |
-| **Threading Model** | `PersistentAgentThread` | `AgentThread` |
-| **Use Case** | Full agent control + file ops | Simplified agent interaction |
+| Feature | Persistent SDK | MAF (`Microsoft.Agents.AI`) | **Hybrid (This Project)** |
+|---------|----------------|----------------------------|---------------------------|
+| **File Upload** | ✅ Supported | ❌ Not exposed | ✅ Via Persistent |
+| **File Download** | ✅ Supported | ❌ Not exposed | ✅ Via Persistent |
+| **Streaming Chat** | ❌ Polling only | ✅ `RunStreamingAsync` | ✅ Via MAF |
+| **IChatClient** | ❌ Not available | ✅ Native support | ✅ Via MAF |
+| **Agent Creation** | Programmatic | Portal or Programmatic | Programmatic |
+| **Threading Model** | `PersistentAgentThread` | `AgentThread` | Both linked |
 
 ## Features
 
+- ✅ **Real-time streaming** responses via MAF `RunStreamingAsync()`
 - ✅ Upload Excel files (.xlsx, .xls) for data analysis
 - ✅ Animated progress indicators during file upload
 - ✅ Code interpreter integration for data analysis and visualization
@@ -83,25 +158,37 @@ The legacy `Azure.AI.Agents.Persistent` SDK provides:
 - ✅ Download visualizations to current directory
 - ✅ Conversational interface with full context retention
 - ✅ Configuration externalization via `appsettings.json`
+- ✅ **IChatClient pattern** - standardized chat abstraction
 
 ## How It Works
 
-### 1. **Agent Setup**
+### 1. **Agent Setup & MAF Wrapper**
 ```csharp
 // Initialize the Persistent Agents Client
 var persistentClient = new PersistentAgentsClient(projectEndpoint, credential);
 
 // Try to get existing agent or create new one
 var agents = persistentClient.Administration.GetAgents();
-var agent = agents.FirstOrDefault(a => a.Name == agentName) 
+var persistentAgent = agents.FirstOrDefault(a => a.Name == agentName) 
     ?? persistentClient.Administration.CreateAgent(
         model: "gpt-4o",
         name: agentName,
         instructions: "You are a helpful data analysis assistant...",
         tools: new List<ToolDefinition> { new CodeInterpreterToolDefinition() }
     ).Value;
+
+// Wrap in Microsoft Agent Framework (MAF) for streaming chat
+IChatClient chatClient = persistentClient.AsIChatClient(persistentAgent.Id);
+ChatClientAgent mafAgent = new ChatClientAgent(
+    chatClient,
+    options: new ChatClientAgentOptions
+    {
+        Id = persistentAgent.Id,
+        Name = persistentAgent.Name,
+        Description = persistentAgent.Description
+    });
 ```
-**Why**: Legacy SDK cannot access portal-created agents, so we create agents programmatically with code interpreter tool enabled.
+**Why Hybrid**: MAF provides the `IChatClient` pattern and streaming, while persistent SDK handles file operations.
 
 ### 2. **File Upload**
 ```csharp
@@ -137,44 +224,47 @@ PersistentAgentThread thread = persistentClient.Threads.CreateThread(
 ```
 **Why**: Files must be attached to threads via `toolResources` for the agent to access them.
 
-### 4. **Agent Execution**
+### 4. **Linked Thread Creation**
 ```csharp
-// Create user message
-persistentClient.Messages.CreateMessage(
-    thread.Id,
-    MessageRole.User,
-    userRequest);
+// Create persistent thread (with or without file attachment)
+PersistentAgentThread persistentThread = persistentClient.Threads.CreateThread(
+    toolResources: toolResources).Value;
 
-// Run the agent
-var run = persistentClient.Runs.CreateRun(thread, agent).Value;
+// Create MAF thread linked to the same conversation
+AgentThread mafThread = mafAgent.GetNewThread(persistentThread.Id);
+```
+**Why**: Both threads share the same conversation ID, enabling MAF streaming while persistent client tracks messages.
 
-// Poll for completion
-while (run.Status == RunStatus.Queued || run.Status == RunStatus.InProgress)
+### 5. **Streaming Chat via MAF**
+```csharp
+// Real-time streaming response
+await foreach (var update in mafAgent.RunStreamingAsync(userRequest, mafThread))
 {
-    await Task.Delay(500);
-    run = persistentClient.Runs.GetRun(thread.Id, run.Id).Value;
+    if (!string.IsNullOrEmpty(update.Text))
+    {
+        Console.Write(update.Text);  // Token-by-token output
+    }
 }
 ```
-**Why**: Explicit run management gives us control over execution and status polling.
+**Why**: MAF's `RunStreamingAsync()` provides real-time token streaming instead of polling.
 
-### 5. **Response Processing & File Download**
+### 6. **Hybrid File Download**
 ```csharp
-// Get messages from the run
+// After MAF streaming completes, use persistent client to find generated files
+var runs = persistentClient.Runs.GetRuns(persistentThread.Id);
+var latestRun = runs.FirstOrDefault();
+
 var messages = persistentClient.Messages.GetMessages(
-    threadId: thread.Id,
+    threadId: persistentThread.Id,
     order: ListSortOrder.Descending);
 
 foreach (var message in messages)
 {
-    if (message.Role == MessageRole.Agent && message.RunId == completedRun.Id)
+    if (message.Role == MessageRole.Agent && message.RunId == latestRun.Id)
     {
         foreach (var content in message.ContentItems)
         {
-            if (content is MessageTextContent textContent)
-            {
-                Console.WriteLine(textContent.Text);
-            }
-            else if (content is MessageImageFileContent imageFileContent)
+            if (content is MessageImageFileContent imageFileContent)
             {
                 // Download generated visualization
                 BinaryData fileContent = persistentClient.Files.GetFileContent(
@@ -185,7 +275,7 @@ foreach (var message in messages)
     }
 }
 ```
-**Why**: Legacy SDK provides `Files.GetFileContent()` to download agent-generated files.
+**Why**: MAF abstracts away `MessageImageFileContent`, so we fall back to the persistent client to extract file IDs and download them.
 
 ## Configuration
 
@@ -290,6 +380,7 @@ dotnet CodeInterpreterClient/bin/Debug/net9.0/CodeInterpreterClient.dll
 
 1. **Agent Connection**
    - Retrieves or creates agent "CodeInterpreterTest"
+   - Wraps agent in MAF `ChatClientAgent`
    - Confirms connection and displays agent name
 
 2. **File Selection**
@@ -304,10 +395,9 @@ dotnet CodeInterpreterClient/bin/Debug/net9.0/CodeInterpreterClient.dll
 
 4. **Conversation Loop**
    - Accepts natural language requests
-   - Sends to agent for processing
-   - Shows progress dots during agent execution
-   - Displays agent responses
-   - Detects generated images/visualizations
+   - **Streams response in real-time** via MAF
+   - Displays agent responses token-by-token
+   - Detects generated images/visualizations via persistent client
 
 5. **File Download** (if files generated)
    - Prompts: "X file(s) generated. Download to current directory? (y/n)"
@@ -317,17 +407,14 @@ dotnet CodeInterpreterClient/bin/Debug/net9.0/CodeInterpreterClient.dll
 6. **Exit**
    - Type "exit" to end session
 
-6. **Exit**
-   - Type "exit" to end session
-
 ## Example Session
 
 ```
-=== Code Interpreter Client ===
+=== Code Interpreter Client (MAF Hybrid) ===
 
 Setting up agent 'CodeInterpreterTest'...
 ✓ Connected to existing agent: CodeInterpreterTest
-✓ Connected to agent: CodeInterpreterTest
+✓ Wrapped agent in MAF: CodeInterpreterTest
 
 Available Excel files in current directory:
 ===========================================
@@ -339,26 +426,24 @@ Enter the number of the Excel file to upload (or press Enter to skip):
 Uploading marketplace_data_50k.xlsx.......................... ✓ Done (2,1 MB)
    File ID: assistant-Rs2PN85aP5rHuP3U2VPxas
 
-✓ Thread created with file attached
+✓ Thread created with file attached (ID: thread_FzsBgRVkWEEgBrIvEL25Kx0Y)
 
 What would you like the code interpreter to do? (type 'exit' to quit)
-> generate a bar chart comparing top 5 products by sales
+> what are the best and the worst sellers? Create a bar chart
 
 === Agent Response ===
-.......................................................
-Agent: 
-[Generated image: assistant-Sxyt44nw8GuHCqcyL16cbs]
-Here is the bar chart illustrating the top 5 products by total sales. According to the chart:
+Agent: To identify the best and worst sellers from the data file you uploaded, I'll first 
+need to examine its contents. Let's load the file and inspect its structure...
 
-- **Laptop** stands out as the product with the highest sales.
-- **CPU, Tablet, and Graphics Card** have relatively similar sales figures.
-- **Smartphone** rounds out the top five with noticeably lower sales compared to the Laptop.
+The analysis shows the following:
+- **Best Seller**: Laptops are the best-selling item with the highest total sales.
+- **Worst Seller**: USB Cables are the worst-selling item with the lowest total sales.
 
-If you need further analysis or insights, feel free to ask!
+The bar chart above visualizes the total sales of different items.
 
 1 file(s) generated. Download to current directory? (y/n)
 > y
-Downloading assistant-Sxyt44nw8GuHCqcyL16cbs ✓ Saved to: agent_output_20251229_180411_cyL16cbs.png
+Downloading assistant-2kXRAbFNbmmdAccQ871hn6 ✓ Saved to: agent_output_20260102_182152_cQ871hn6.png
 
 --- Ready for next request ---
 
@@ -372,106 +457,158 @@ Exiting...
 
 ## Key AI Components
 
-**Agent Creation**
+**Agent Creation & MAF Wrapper**
 ```csharp
 var persistentClient = new PersistentAgentsClient(projectEndpoint, credential);
-var agent = persistentClient.Administration.CreateAgent(
+var persistentAgent = persistentClient.Administration.CreateAgent(
     model: "gpt-4o",
     name: agentName,
     instructions: "You are a helpful data analysis assistant...",
     tools: new List<ToolDefinition> { new CodeInterpreterToolDefinition() }
 ).Value;
-```
-Creates an agent programmatically with code interpreter capabilities.
 
-**Thread with File Attachment**
+// Wrap in MAF for streaming
+IChatClient chatClient = persistentClient.AsIChatClient(persistentAgent.Id);
+ChatClientAgent mafAgent = new ChatClientAgent(chatClient, options: new ChatClientAgentOptions
+{
+    Id = persistentAgent.Id,
+    Name = persistentAgent.Name
+});
+```
+
+**Thread with File Attachment (Linked)**
 ```csharp
 var toolResources = new ToolResources
 {
     CodeInterpreter = new CodeInterpreterToolResource()
 };
 toolResources.CodeInterpreter.FileIds.Add(uploadedFileId);
-var thread = persistentClient.Threads.CreateThread(toolResources: toolResources);
+
+// Create persistent thread with file
+var persistentThread = persistentClient.Threads.CreateThread(toolResources: toolResources).Value;
+// Link MAF thread to same conversation
+var mafThread = mafAgent.GetNewThread(persistentThread.Id);
 ```
-**Critical**: Files must be attached during thread creation for agent access.
+**Critical**: Both threads share the same conversation ID for hybrid operation.
 
-**Agent Execution**
+**Streaming Chat via MAF**
 ```csharp
-persistentClient.Messages.CreateMessage(thread.Id, MessageRole.User, userRequest);
-var run = persistentClient.Runs.CreateRun(thread, agent).Value;
-
-while (run.Status == RunStatus.Queued || run.Status == RunStatus.InProgress)
+await foreach (var update in mafAgent.RunStreamingAsync(userRequest, mafThread))
 {
-    await Task.Delay(500);
-    run = persistentClient.Runs.GetRun(thread.Id, run.Id).Value;
+    if (!string.IsNullOrEmpty(update.Text))
+        Console.Write(update.Text);  // Real-time token streaming
 }
 ```
-Sends user message and polls for completion.
+Real-time response streaming instead of polling.
 
-**Response Processing**
+**Hybrid File Download**
 ```csharp
-var messages = persistentClient.Messages.GetMessages(thread.Id);
-foreach (var message in messages.Where(m => m.Role == MessageRole.Agent))
+// After streaming completes, query persistent client for file IDs
+var runs = persistentClient.Runs.GetRuns(persistentThread.Id);
+var latestRun = runs.FirstOrDefault();
+
+var messages = persistentClient.Messages.GetMessages(persistentThread.Id);
+foreach (var message in messages.Where(m => m.Role == MessageRole.Agent && m.RunId == latestRun.Id))
 {
     foreach (var content in message.ContentItems)
     {
-        if (content is MessageTextContent textContent)
-            Console.WriteLine(textContent.Text);
-        else if (content is MessageImageFileContent imageFileContent)
+        if (content is MessageImageFileContent imageFileContent)
+        {
             // Download generated visualization
             var fileContent = persistentClient.Files.GetFileContent(imageFileContent.FileId).Value;
+            await File.WriteAllBytesAsync(filePath, fileContent.ToArray());
+        }
     }
 }
 ```
-Retrieves agent responses and detects generated images.
+MAF abstracts file references, so persistent client extracts actual file IDs.
 
-## Migration Path to Modern SDK
+## Architecture Diagram
 
-When `Microsoft.Agents.AI` adds file upload support:
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    Code Interpreter Client                       │
+│                      (MAF Hybrid Architecture)                   │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  ┌──────────────────┐         ┌──────────────────────────────┐  │
+│  │  User Interface  │         │  Microsoft Agent Framework   │  │
+│  │                  │────────▶│  (ChatClientAgent)           │  │
+│  │  Console I/O     │         │                              │  │
+│  └──────────────────┘         │  • IChatClient interface     │  │
+│          │                    │  • RunStreamingAsync()       │  │
+│          │                    │  • Real-time tokens          │  │
+│          │                    └──────────────┬───────────────┘  │
+│          │                                   │                   │
+│          │                    ┌──────────────▼───────────────┐  │
+│          │                    │  Azure.AI.Agents.Persistent  │  │
+│          └───────────────────▶│  (PersistentAgentsClient)    │  │
+│                               │                              │  │
+│                               │  • Files.UploadFileAsync()   │  │
+│                               │  • Messages.GetMessages()    │  │
+│                               │  • Files.GetFileContent()    │  │
+│                               └──────────────┬───────────────┘  │
+│                                              │                   │
+└──────────────────────────────────────────────┼───────────────────┘
+                                               │
+                                               ▼
+                              ┌────────────────────────────────┐
+                              │     Azure AI Foundry           │
+                              │                                │
+                              │  • gpt-4o model deployment     │
+                              │  • Code Interpreter tool       │
+                              │  • File storage                │
+                              └────────────────────────────────┘
+```
 
-1. **Replace Package**:
-   ```xml
-   <!-- Remove -->
-   <PackageReference Include="Azure.AI.Agents.Persistent" Version="*-*" />
-   
-   <!-- Add -->
-   <PackageReference Include="Microsoft.Agents.AI.AzureAI" Version="*-*" />
-   ```
+## Future Migration
 
-2. **Update Client**:
-   ```csharp
-   // Instead of PersistentAgentsClient
-   var aiProjectClient = new AIProjectClient(new Uri(projectEndpoint), credential);
-   AIAgent agent = aiProjectClient.GetAIAgent(name: agentName);
-   ```
+When MAF adds native file operation support, the hybrid approach can be simplified:
 
-3. **Use Portal-Created Agents**:
-   No need for programmatic agent creation—just retrieve by name.
+```csharp
+// Future: Pure MAF approach (when file APIs are available)
+IChatClient chatClient = persistentClient.AsIChatClient(agentId);
+ChatClientAgent agent = new ChatClientAgent(chatClient, options);
 
-4. **Watch for**: File upload/download APIs in future SDK versions.
+// All operations via MAF - no need for persistent client fallback
+await foreach (var update in agent.RunStreamingAsync(request, thread))
+{
+    // Handle text and file content directly from MAF
+}
+```
 
 ## Relationship to Microsoft Agent Framework
 
 ```
 Microsoft Agent Framework (MAF)
+├── Interfaces
+│   ├── IChatClient (Microsoft.Extensions.AI)
+│   ├── ChatClientAgent (Microsoft.Agents.AI)
+│   └── AgentThread
 ├── Hosting Options
 │   ├── Azure Functions (Durable Agents)
 │   ├── ASP.NET Core
 │   └── Console Apps (this project)
-├── SDK Versions
-│   ├── Modern: Microsoft.Agents.AI (preview)
-│   │   ├── Simplified API
-│   │   └── Portal integration
-│   └── Legacy: Azure.AI.Agents.Persistent (stable)
-│       ├── Full API surface
-│       └── File operations ← WE ARE HERE
+├── SDK Integration
+│   ├── AsIChatClient() extension method
+│   └── Persistent SDK compatibility
 └── Azure AI Foundry
     ├── Project endpoint
     ├── Model deployments
     └── Agent configurations
+
+This Project (Hybrid Architecture)
+├── MAF Layer
+│   ├── ChatClientAgent wrapper
+│   ├── RunStreamingAsync() for chat
+│   └── IChatClient pattern
+└── Persistent Layer ← File operations
+    ├── Files.UploadFileAsync()
+    ├── Messages.GetMessages()
+    └── Files.GetFileContent()
 ```
 
-This project uses MAF patterns (agent instructions, tools, threads) via the legacy SDK to access file upload capabilities not yet available in the modern SDK.
+This project uses MAF for the chat interface while falling back to the persistent SDK for file operations not yet exposed in MAF.
 
 ## Project Files
 

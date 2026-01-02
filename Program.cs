@@ -8,6 +8,8 @@ using System.Threading.Tasks;
 using System.Collections.Generic;
 using Microsoft.Extensions.Configuration;
 using Azure.AI.Agents.Persistent;
+using Microsoft.Agents.AI;
+using Microsoft.Extensions.AI;
 
 namespace CodeInterpreterClient;
 
@@ -15,7 +17,7 @@ public static class Program
 {
     public static async Task Main(string[] args)
     {
-        Console.WriteLine("=== Code Interpreter Client ===\n");
+        Console.WriteLine("=== Code Interpreter Client (MAF Hybrid) ===\n");
 
         try
         {
@@ -40,12 +42,12 @@ public static class Program
 
             // Try to get existing agent or create a new one
             var agents = persistentClient.Administration.GetAgents();
-            var agent = agents.FirstOrDefault(a => a.Name == agentName);
+            var persistentAgent = agents.FirstOrDefault(a => a.Name == agentName);
             
-            if (agent == null)
+            if (persistentAgent == null)
             {
                 Console.WriteLine($"Creating new agent '{agentName}'...");
-                agent = persistentClient.Administration.CreateAgent(
+                persistentAgent = persistentClient.Administration.CreateAgent(
                     model: "gpt-4o",
                     name: agentName,
                     instructions: "You are a helpful data analysis assistant with access to a code interpreter. " +
@@ -53,14 +55,24 @@ public static class Program
                                   "Use the code interpreter to read, process, and visualize data as needed.",
                     tools: new List<ToolDefinition> { new CodeInterpreterToolDefinition() }
                 ).Value;
-                Console.WriteLine($"✓ Agent created: {agent.Name}");
+                Console.WriteLine($"✓ Agent created: {persistentAgent.Name}");
             }
             else
             {
-                Console.WriteLine($"✓ Connected to existing agent: {agent.Name}");
+                Console.WriteLine($"✓ Connected to existing agent: {persistentAgent.Name}");
             }
             
-            Console.WriteLine($"✓ Connected to agent: {agent.Name}");
+            // Wrap the persistent agent in Microsoft Agent Framework (MAF) for streaming chat
+            IChatClient chatClient = persistentClient.AsIChatClient(persistentAgent.Id);
+            ChatClientAgent mafAgent = new ChatClientAgent(
+                chatClient,
+                options: new ChatClientAgentOptions
+                {
+                    Id = persistentAgent.Id,
+                    Name = persistentAgent.Name,
+                    Description = persistentAgent.Description
+                });
+            Console.WriteLine($"✓ Wrapped agent in MAF: {mafAgent.Name}");
             Console.WriteLine();
 
             // Step 1: List available Excel files in current directory (one time at start)
@@ -79,65 +91,60 @@ public static class Program
             }
             Console.WriteLine();
 
-            // Step 2: Ask user to select Excel file to upload (one time at start)
-            Console.Write("Enter the number of the Excel file to upload (or press Enter to skip): ");
-            var selection = Console.ReadLine();
-
-            string? uploadedFilePath = null;
-            string? uploadedFileId = null;
-            
-            if (!string.IsNullOrWhiteSpace(selection) && int.TryParse(selection, out int fileIndex) 
-                && fileIndex > 0 && fileIndex <= availableFiles.Count)
+            // Step 2: Ask user to select Excel file to upload (required)
+            if (availableFiles.Count == 0)
             {
-                uploadedFilePath = availableFiles[fileIndex - 1];
-                Console.Write($"\nUploading {uploadedFilePath}");
-                
-                // Upload file with progress dots
-                var uploadTask = Task.Run(async () =>
-                {
-                    var fileInfo = await persistentClient.Files.UploadFileAsync(
-                        filePath: uploadedFilePath,
-                        purpose: PersistentAgentFilePurpose.Agents);
-                    return fileInfo.Value.Id;
-                });
-                
-                // Show progress dots while uploading
-                while (!uploadTask.IsCompleted)
-                {
-                    Console.Write(".");
-                    await Task.Delay(300);
-                }
-                
-                uploadedFileId = await uploadTask;
-                var fileSize = new FileInfo(uploadedFilePath).Length;
-                Console.WriteLine($" ✓ Done ({FormatFileSize(fileSize)})");
-                Console.WriteLine($"   File ID: {uploadedFileId}\n");
-            }
-            else
-            {
-                Console.WriteLine("No file selected.\n");
+                Console.WriteLine("No Excel files found in current directory.");
+                Console.WriteLine("Please add .xlsx or .xls files to the directory and try again.");
+                return;
             }
 
-            // Create a new thread for this session
-            PersistentAgentThread thread;
-            
-            // Attach file to thread if uploaded
-            if (!string.IsNullOrEmpty(uploadedFileId))
+            int fileIndex;
+            while (true)
             {
-                var toolResources = new ToolResources
-                {
-                    CodeInterpreter = new CodeInterpreterToolResource()
-                };
-                toolResources.CodeInterpreter.FileIds.Add(uploadedFileId);
+                Console.Write("Enter the number of the Excel file to upload: ");
+                var selection = Console.ReadLine();
                 
-                // Create thread with tool resources  
-                thread = persistentClient.Threads.CreateThread(toolResources: toolResources);
-                Console.WriteLine($"✓ Thread created with file attached\n");
+                if (int.TryParse(selection, out fileIndex) && fileIndex > 0 && fileIndex <= availableFiles.Count)
+                    break;
+                    
+                Console.WriteLine($"Please enter a number between 1 and {availableFiles.Count}");
             }
-            else
+
+            var uploadedFilePath = availableFiles[fileIndex - 1];
+            Console.Write($"\nUploading {uploadedFilePath}");
+            
+            // Upload file with progress dots
+            var uploadTask = Task.Run(async () =>
             {
-                thread = persistentClient.Threads.CreateThread();
+                var fileInfo = await persistentClient.Files.UploadFileAsync(
+                    filePath: uploadedFilePath,
+                    purpose: PersistentAgentFilePurpose.Agents);
+                return fileInfo.Value.Id;
+            });
+            
+            // Show progress dots while uploading
+            while (!uploadTask.IsCompleted)
+            {
+                Console.Write(".");
+                await Task.Delay(300);
             }
+            
+            var uploadedFileId = await uploadTask;
+            var fileSize = new FileInfo(uploadedFilePath).Length;
+            Console.WriteLine($" ✓ Done ({FormatFileSize(fileSize)})");
+            Console.WriteLine($"   File ID: {uploadedFileId}\n");
+
+            // Create a new thread with file attached (hybrid: persistent thread + MAF thread)
+            var toolResources = new ToolResources
+            {
+                CodeInterpreter = new CodeInterpreterToolResource()
+            };
+            toolResources.CodeInterpreter.FileIds.Add(uploadedFileId);
+            
+            var persistentThread = persistentClient.Threads.CreateThread(toolResources: toolResources).Value;
+            var mafThread = mafAgent.GetNewThread(persistentThread.Id);
+            Console.WriteLine($"✓ Thread created with file attached (ID: {persistentThread.Id})\n");
 
             // Main conversation loop - continues until user types "exit"
             while (true)
@@ -160,79 +167,51 @@ public static class Program
                     break;
                 }
 
-                // Step 4: Send request to agent and get response
+                // Step 4: Send request to agent using MAF streaming
                 Console.WriteLine("\n=== Agent Response ===");
+                Console.Write("Agent: ");
                 
-                // Create message in thread
-                persistentClient.Messages.CreateMessage(
-                    thread.Id,
-                    MessageRole.User,
-                    userRequest);
-                
-                // Show progress indicator while running
-                var runTask = Task.Run(async () =>
+                // Use MAF streaming for real-time response
+                await foreach (var update in mafAgent.RunStreamingAsync(userRequest, mafThread))
                 {
-                    // Run the agent
-                    var runResponse = persistentClient.Runs.CreateRun(thread, agent);
-                    var run = runResponse.Value;
-                    
-                    // Wait for completion
-                    while (run.Status == RunStatus.Queued || run.Status == RunStatus.InProgress)
+                    if (!string.IsNullOrEmpty(update.Text))
                     {
-                        await Task.Delay(500);
-                        run = persistentClient.Runs.GetRun(thread.Id, run.Id).Value;
+                        Console.Write(update.Text);
                     }
-                    
-                    return run;
-                });
-                
-                // Show progress dots
-                while (!runTask.IsCompleted)
-                {
-                    Console.Write(".");
-                    await Task.Delay(500);
                 }
                 Console.WriteLine();
                 
-                var completedRun = await runTask;
-                
-                // Get messages and display the assistant's response
-                var messages = persistentClient.Messages.GetMessages(
-                    threadId: thread.Id,
-                    order: ListSortOrder.Descending);
+                // HYBRID: Use persistent client to check for generated files
+                // Get the latest run to find its ID
+                var runs = persistentClient.Runs.GetRuns(persistentThread.Id);
+                var latestRun = runs.FirstOrDefault();
                 
                 List<string> imageFileIds = new List<string>();
-                bool foundResponse = false;
                 
-                // Get the latest agent messages from this run
-                foreach (var message in messages)
+                if (latestRun != null)
                 {
-                    // Only process messages from this run
-                    if (message.Role == MessageRole.Agent && message.RunId == completedRun.Id)
+                    // Get messages and extract file IDs from the latest run
+                    var messages = persistentClient.Messages.GetMessages(
+                        threadId: persistentThread.Id,
+                        order: ListSortOrder.Descending);
+                    
+                    foreach (var message in messages)
                     {
-                        if (!foundResponse)
+                        if (message.Role == MessageRole.Agent && message.RunId == latestRun.Id)
                         {
-                            Console.Write("Agent: ");
-                            foundResponse = true;
-                        }
-                        
-                        foreach (var content in message.ContentItems)
-                        {
-                            if (content is MessageTextContent textContent)
+                            foreach (var content in message.ContentItems)
                             {
-                                Console.WriteLine(textContent.Text);
-                            }
-                            else if (content is MessageImageFileContent imageFileContent)
-                            {
-                                Console.WriteLine($"\n[Generated image: {imageFileContent.FileId}]");
-                                imageFileIds.Add(imageFileContent.FileId);
+                                if (content is MessageImageFileContent imageFileContent)
+                                {
+                                    imageFileIds.Add(imageFileContent.FileId);
+                                }
                             }
                         }
-                    }
-                    else if (foundResponse)
-                    {
-                        // Stop after processing all messages from this run
-                        break;
+                        else if (message.Role == MessageRole.User)
+                        {
+                            // Stop when we hit user messages
+                            break;
+                        }
                     }
                 }
                 
@@ -241,9 +220,9 @@ public static class Program
                 {
                     Console.WriteLine($"\n{imageFileIds.Count} file(s) generated. Download to current directory? (y/n)");
                     Console.Write("> ");
-                    var downloadResponse = Console.ReadLine();
+                    var downloadResponse = Console.ReadLine()?.Trim().ToLowerInvariant();
                     
-                    if (downloadResponse?.Trim().Equals("y", StringComparison.OrdinalIgnoreCase) == true)
+                    if (downloadResponse == "y" || downloadResponse == "yes")
                     {
                         foreach (var fileId in imageFileIds)
                         {
